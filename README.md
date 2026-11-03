@@ -12,7 +12,13 @@ Users can create an account with an email address and password, sign in with a s
 
 Saving is optional and is performed only after the user chooses **Save to my account**. A saved program contains its pathway, route, starting scores, generated schedule, and any restriction note included in the original profile. Event-search location is not saved. Data remains until the user deletes it or the database is removed. Sessions expire after 30 days. Email verification and password reset are not configured yet; users should use an email they control and keep their password safe.
 
-The account API requires a persistent Postgres `DATABASE_URL` and a `PLAN_ENCRYPTION_KEY` containing 64 hexadecimal characters. The private dashboard also requires a unique `ADMIN_ACCESS_KEY` with at least 32 bytes. Keep all three as server-side secrets; never publish them in this repository or in browser code. The database schema is created by the server at startup. The encryption key must remain available to decrypt saved programs; changing or losing it makes existing saved program contents unreadable.
+The account API requires a Postgres `DATABASE_URL` and a `PLAN_ENCRYPTION_KEY` containing 64 hexadecimal characters. The private dashboard also requires a unique `ADMIN_ACCESS_KEY` with at least 32 bytes. Keep all three as server-side secrets; never publish them in this repository or in browser code. The database schema is created by the server at startup. The encryption key must remain available to decrypt saved programs; changing or losing it makes existing saved program contents unreadable.
+
+### Supabase Free Postgres setup
+
+The server uses the standard PostgreSQL `pg` driver, so a Supabase database works directly without exposing Supabase keys to the browser. Create a Supabase project, open **Connect**, and copy the **Session pooler** connection string (port `5432`). Replace its password placeholder, retain `sslmode=require`, and set the full string as `DATABASE_URL` in the Render service's private environment settings. Reserved characters in the password must be URL-encoded. Do not use a Supabase `anon` or `service_role` API key here. Also set `PLAN_ENCRYPTION_KEY` and `ADMIN_ACCESS_KEY` in Render; save changes and redeploy. Confirm `/health` reports both `accountsAvailable` and `adminConfigured` as `true`, then open `/admin.html` and sign in with the dashboard key.
+
+Supabase Free currently includes a 500 MB database per project and can pause projects after a week of low activity. Plan for the database to need resuming if it is inactive; check Supabase's current plan limits before relying on it for continuous availability.
 
 ## Run the server
 
