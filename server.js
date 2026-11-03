@@ -328,9 +328,10 @@ async function requireSession(request, response, { csrf = false } = {}) {
 async function createSession(response, user) {
   const token = randomBytes(32).toString('base64url');
   const csrfToken = randomBytes(32).toString('base64url');
+  const expiresAt = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
   await database.query(
-    'INSERT INTO sessions(id, user_id, token_hash, csrf_hash, expires_at) VALUES($1, $2, $3, $4, now() + ($5 * interval \'1 day\'))',
-    [randomUUID(), user.id, sha256(token), sha256(csrfToken), SESSION_DAYS],
+    'INSERT INTO sessions(id, user_id, token_hash, csrf_hash, expires_at) VALUES($1, $2, $3, $4, $5)',
+    [randomUUID(), user.id, sha256(token), sha256(csrfToken), expiresAt],
   );
   setSessionCookie(response, token);
   return { user: { email: user.email }, csrfToken };
