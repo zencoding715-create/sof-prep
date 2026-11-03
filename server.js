@@ -85,7 +85,14 @@ async function initializeDatabase() {
     databaseReady = true;
     return true;
   } catch (error) {
-    console.error('Account storage could not initialize; account routes will stay unavailable.');
+    const knownCodes = new Set([
+      'SELF_SIGNED_CERT_IN_CHAIN', 'DEPTH_ZERO_SELF_SIGNED_CERT',
+      'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'CERT_HAS_EXPIRED', 'ERR_TLS_CERT_ALTNAME_INVALID',
+      'ENOTFOUND', 'ETIMEDOUT', 'ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH',
+      '28P01', '28000', '3D000', '42501', '53300', '57P01',
+    ]);
+    const diagnostic = knownCodes.has(error?.code) ? error.code : 'DATABASE_INITIALIZATION_FAILED';
+    console.error(`Account storage could not initialize (${diagnostic}); account routes will stay unavailable.`);
     return false;
   }
 }
