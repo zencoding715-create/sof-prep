@@ -21,6 +21,7 @@ const MAX_ACCOUNT_BODY_BYTES = 1024 * 1024;
 const RATE_WINDOW_MS = 60 * 60 * 1000;
 const RATE_LIMIT = 5;
 const rateBuckets = new Map();
+const planAccountBuckets = new Map();
 const authRateBuckets = new Map();
 const SESSION_DAYS = 30;
 const SESSION_COOKIE = 'fg_session';
@@ -844,20 +845,24 @@ function validatePlan(plan, input) {
   };
 }
 
-function takeRateToken(request, response, headers) {
-  const key = request.headers['x-forwarded-for']?.split(',').at(-1)?.trim() || request.socket.remoteAddress || 'unknown';
+function takeRateToken(request, response, headers, accountId) {
+  const ip = request.headers['x-forwarded-for']?.split(',').at(-1)?.trim() || request.socket.remoteAddress || 'unknown';
   const now = Date.now();
-  let bucket = rateBuckets.get(key);
-  if (!bucket || now - bucket.start >= RATE_WINDOW_MS) bucket = { start: now, count: 0 };
-  bucket.count += 1;
-  rateBuckets.set(key, bucket);
-  if (rateBuckets.size > 3000) {
-    for (const [ip, item] of rateBuckets) if (now - item.start >= RATE_WINDOW_MS) rateBuckets.delete(ip);
-  }
-  if (bucket.count > RATE_LIMIT) {
-    const retryAfter = Math.max(1, Math.ceil((RATE_WINDOW_MS - (now - bucket.start)) / 1000));
+  const buckets = [[rateBuckets, ip], [planAccountBuckets, accountId]].map(([store, key]) => {
+    let bucket = store.get(key);
+    if (!bucket || now - bucket.start >= RATE_WINDOW_MS) bucket = { start: now, count: 0 };
+    return { store, key, bucket };
+  });
+  const limited = buckets.find(({ bucket }) => bucket.count >= RATE_LIMIT);
+  if (limited) {
+    const retryAfter = Math.max(1, Math.ceil((RATE_WINDOW_MS - (now - limited.bucket.start)) / 1000));
     sendJson(response, 429, { error: 'Plan request limit reached. Please wait before building another plan.' }, { ...headers, 'retry-after': String(retryAfter) });
     return false;
+  }
+  for (const { store, key, bucket } of buckets) {
+    bucket.count += 1;
+    store.set(key, bucket);
+    if (store.size > 3000) for (const [oldKey, item] of store) if (now - item.start >= RATE_WINDOW_MS) store.delete(oldKey);
   }
   return true;
 }
@@ -981,12 +986,16 @@ const server = createServer(async (request, response) => {
     if (cors === null) { sendJson(response, 403, { error: 'This website is not allowed to use the plan API.' }); return; }
     if (request.method === 'OPTIONS') { response.writeHead(204, cors); response.end(); return; }
     if (request.method !== 'POST') { sendJson(response, 405, { error: 'Use POST to create a plan.' }, { ...cors, allow: 'POST, OPTIONS' }); return; }
+    if (!passwordCookieOriginOnly(request, response)) return;
     if (request.headers['content-type']?.split(';')[0] !== 'application/json') { sendJson(response, 415, { error: 'Send plan details as JSON.' }, cors); return; }
-    if (!takeRateToken(request, response, cors)) return;
+    const session = await requireSession(request, response, { csrf: true });
+    if (!session) return;
+    if (!process.env.OPENAI_API_KEY) { sendJson(response, 503, { error: 'The AI service has not been configured yet.' }, cors); return; }
     try {
       const input = await readJson(request);
       const issue = validateInput(input);
       if (issue) { sendJson(response, 400, { error: issue }, cors); return; }
+      if (!takeRateToken(request, response, cors, session.user_id)) return;
       const plan = await createPlan(input);
       sendJson(response, 200, plan, cors);
     } catch (error) {
