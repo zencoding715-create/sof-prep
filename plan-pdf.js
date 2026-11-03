@@ -33,15 +33,15 @@
       for (const paragraph of toText(value).replace(/\r\n?/g, '\n').split('\n')) {
         if (!paragraph) { result.push(''); continue; }
         let line = '';
-        for (const unit of graphemes(paragraph)) {
-          const next = line + unit;
-          if (line && ctx.measureText(next).width > width) {
-            let cut = line.lastIndexOf(' ');
-            if (cut > 0) {
-              result.push(line.slice(0, cut));
-              line = line.slice(cut + 1) + unit;
-            } else { result.push(line); line = unit; }
-          } else line = next;
+        for (const word of paragraph.trim().split(/\s+/)) {
+          const candidate = line ? `${line} ${word}` : word;
+          if (ctx.measureText(candidate).width <= width) { line = candidate; continue; }
+          if (line) { result.push(line); line = ''; }
+          if (ctx.measureText(word).width <= width) { line = word; continue; }
+          for (const unit of graphemes(word)) {
+            if (line && ctx.measureText(line + unit).width > width) { result.push(line); line = unit; }
+            else line += unit;
+          }
         }
         result.push(line);
       }
