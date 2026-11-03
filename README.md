@@ -1,6 +1,6 @@
 # FIELDGUIDE — Special Warfare Prep
 
-FIELDGUIDE is a public preparation website with pathway-specific score comparisons and an AI-generated, week-by-week training course. The front end remains a static GitHub Pages site; plan generation runs through the server-side API in `server.js`.
+FIELDGUIDE is a public preparation website with pathway-specific score comparisons and an AI-generated, week-by-week training course. Each week includes a stated effort target and personalized progression based on the selected route, entered score gaps, experience, time, equipment, and timeline. The front end remains a static GitHub Pages site; plan generation runs through the server-side API in `server.js`.
 
 ## AI plan API
 
@@ -16,4 +16,4 @@ Requires Node.js 20 or newer. Set `OPENAI_API_KEY` in the server environment, th
 
 The project is connected to GitHub Pages for the public site and Render for the API server. Render builds with `npm install --omit=dev` and starts with `npm start`. Configure `OPENAI_API_KEY` as a Render secret. Keep `index.html`, `.nojekyll`, `robots.txt`, and `qualification-guides/` together at the published site root so the guide links work.
 
-FIELDGUIDE is an independent preparation resource, not an official military recruiting or medical source. Verify current requirements with the relevant service and review AI-generated training with a qualified professional.
+FIELDGUIDE is an independent preparation resource, not an official military recruiting or medical source. Verify current requirements with the relevant service and review AI-generated training with a qualified professional. The intensity reference is Jake Zweig’s publicly described hard/easy training cycles, recovery weeks, and tapering; FIELDGUIDE does not reproduce his paid program or claim identical weekly volume.
