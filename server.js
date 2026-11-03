@@ -26,12 +26,24 @@ const SESSION_DAYS = 30;
 const SESSION_COOKIE = 'fg_session';
 const ADMIN_SESSION_HOURS = 12;
 const ADMIN_SESSION_COOKIE = 'fg_admin_session';
-const database = process.env.DATABASE_URL ? new Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-}) : null;
+
+async function databaseOptions(connectionString) {
+  const options = { connectionString, max: 5, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000 };
+  let databaseUrl;
+  try { databaseUrl = new URL(connectionString); } catch { return options; }
+  if (/(^|\.)supabase\.(com|co)$/i.test(databaseUrl.hostname)) {
+    // pg replaces explicit SSL settings when these URL options are present.
+    for (const key of ['ssl', 'sslmode', 'sslcert', 'sslkey', 'sslrootcert']) databaseUrl.searchParams.delete(key);
+    options.connectionString = databaseUrl.toString();
+    options.ssl = {
+      ca: await readFile(path.join(ROOT, 'certs', 'supabase-root-2021.crt'), 'utf8'),
+      rejectUnauthorized: true,
+    };
+  }
+  return options;
+}
+
+const database = process.env.DATABASE_URL ? new Pool(await databaseOptions(process.env.DATABASE_URL)) : null;
 
 let databaseReady = false;
 const PLAN_KEY_HEX = process.env.PLAN_ENCRYPTION_KEY || '';

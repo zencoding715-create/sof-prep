@@ -20,6 +20,8 @@ The server uses the standard PostgreSQL `pg` driver, so a Supabase database work
 
 Supabase Free currently includes a 500 MB database per project and can pause projects after a week of low activity. Plan for the database to need resuming if it is inactive; check Supabase's current plan limits before relying on it for continuous availability.
 
+For Supabase hosts, the server uses the bundled public `certs/supabase-root-2021.crt` certificate and verifies both the certificate chain and hostname. It removes conflicting SSL URL parameters before passing the verified TLS settings to `pg`. The certificate comes from Supabase's dashboard source (`https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt`); SHA-256 fingerprint: `807025ad50d4ed219d2c9c7d299c004f824eb00cf7f65afef607d07b72e6cafa`. Its expiry is April 26, 2031; update it when Supabase rotates its root. Keep the certificate file with the server deployment.
+
 ## Run the server
 
 Requires Node.js 20 or newer. Install dependencies with `npm install`, configure `OPENAI_API_KEY`, `DATABASE_URL`, `PLAN_ENCRYPTION_KEY`, and `ADMIN_ACCESS_KEY` in the server environment, then run `npm start`. The server hosts the static pages and exposes `POST /api/generate-plan`, account endpoints under `/api/auth` and `/api/plans`, owner dashboard endpoints under `/api/admin`, and `GET /health`. It binds to `0.0.0.0` and uses the platform-provided `PORT` when deployed.
