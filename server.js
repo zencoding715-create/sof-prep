@@ -1,21 +1,84 @@
 import { createServer } from 'node:http';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import pg from 'pg';
+
+const { Pool } = pg;
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 10000);
 const MODEL = process.env.OPENAI_MODEL || 'gpt-6-astra';
 const ALLOWED_ORIGINS = new Set(
-  (process.env.ALLOWED_ORIGINS || 'https://zencoding715-create.github.io')
+  (process.env.ALLOWED_ORIGINS || 'https://zencoding715-create.github.io,https://sof-prep-ai.onrender.com')
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean),
 );
 const MAX_BODY_BYTES = 48 * 1024;
+const MAX_ACCOUNT_BODY_BYTES = 1024 * 1024;
 const RATE_WINDOW_MS = 60 * 60 * 1000;
 const RATE_LIMIT = 5;
 const rateBuckets = new Map();
+const authRateBuckets = new Map();
+const SESSION_DAYS = 30;
+const SESSION_COOKIE = 'fg_session';
+const database = process.env.DATABASE_URL ? new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+}) : null;
+
+let databaseReady = false;
+const PLAN_KEY_HEX = process.env.PLAN_ENCRYPTION_KEY || '';
+const planEncryptionKey = /^[a-f0-9]{64}$/i.test(PLAN_KEY_HEX) ? Buffer.from(PLAN_KEY_HEX, 'hex') : null;
+const accountStorageReady = () => databaseReady && Boolean(planEncryptionKey);
+const databaseInitialization = database ? initializeDatabase() : Promise.resolve(false);
+
+async function initializeDatabase() {
+  try {
+    await database.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id uuid PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        password_hash text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS sessions (
+        id uuid PRIMARY KEY,
+        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash char(64) NOT NULL UNIQUE,
+        csrf_hash char(64) NOT NULL,
+        expires_at timestamptz NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id);
+      CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
+      CREATE TABLE IF NOT EXISTS plans (
+        id uuid PRIMARY KEY,
+        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title text NOT NULL,
+        pathway text NOT NULL,
+        route text NOT NULL,
+        weeks smallint NOT NULL,
+        plan jsonb NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS plans_user_created_idx ON plans(user_id, created_at DESC);
+      DELETE FROM sessions WHERE expires_at < now();
+    `);
+    databaseReady = true;
+    return true;
+  } catch (error) {
+    console.error('Account storage could not initialize; account routes will stay unavailable.');
+    return false;
+  }
+}
+
+database?.on('error', () => console.error('Account database connection failed.'));
 
 const PLAN_SCHEMA = {
   type: 'object',
@@ -101,13 +164,13 @@ function corsHeaders(request) {
   };
 }
 
-function readJson(request) {
+function readJson(request, maxBytes = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     request.on('data', (chunk) => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
+      if (size > maxBytes) {
         reject(Object.assign(new Error('Request is too large.'), { statusCode: 413 }));
         request.destroy();
         return;
@@ -127,6 +190,348 @@ function readJson(request) {
 
 function cleanText(value, maxLength = 220) {
   return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function cookieValue(request, name) {
+  const cookieHeader = request.headers.cookie || '';
+  for (const part of cookieHeader.split(';')) {
+    const [key, ...value] = part.trim().split('=');
+    if (key === name) return value.join('=');
+  }
+  return '';
+}
+
+function sameOriginRequest(request) {
+  const origin = request.headers.origin;
+  const host = request.headers.host;
+  if (!origin || !host || origin === 'null') return false;
+  try {
+    const parsed = new URL(origin);
+    const forwarded = request.headers['x-forwarded-proto'];
+    const protocol = (forwarded ? forwarded.split(',')[0].trim() : parsed.protocol.replace(':', '')).toLowerCase();
+    return parsed.origin === `${protocol}://${host.toLowerCase()}`;
+  } catch {
+    return false;
+  }
+}
+
+function authRateAllowed(request, response, action, limit = 10, windowMs = 15 * 60 * 1000) {
+  const ip = request.headers['x-forwarded-for']?.split(',').at(-1)?.trim() || request.socket.remoteAddress || 'unknown';
+  const key = `${action}:${ip}`;
+  const now = Date.now();
+  let bucket = authRateBuckets.get(key);
+  if (!bucket || now - bucket.start >= windowMs) bucket = { start: now, count: 0 };
+  bucket.count += 1;
+  authRateBuckets.set(key, bucket);
+  if (authRateBuckets.size > 3000) {
+    for (const [bucketKey, item] of authRateBuckets) if (now - item.start >= windowMs) authRateBuckets.delete(bucketKey);
+  }
+  if (bucket.count <= limit) return true;
+  sendJson(response, 429, { error: 'Too many attempts. Please wait and try again.' }, {
+    'retry-after': String(Math.max(1, Math.ceil((windowMs - (now - bucket.start)) / 1000))),
+  });
+  return false;
+}
+
+function setSessionCookie(response, token) {
+  response.setHeader('set-cookie', `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_DAYS * 24 * 60 * 60}`);
+}
+
+function clearSessionCookie(response) {
+  response.setHeader('set-cookie', `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`);
+}
+
+async function hashPassword(password) {
+  const salt = randomBytes(16);
+  const hash = await new Promise((resolve, reject) => {
+    scrypt(password, salt, 64, { N: 16384, r: 8, p: 1 }, (error, result) => error ? reject(error) : resolve(result));
+  });
+  return `scrypt$16384$8$1$${salt.toString('hex')}$${Buffer.from(hash).toString('hex')}`;
+}
+
+async function verifyPassword(password, encoded) {
+  const [algorithm, n, r, p, saltHex, hashHex] = (encoded || '').split('$');
+  if (algorithm !== 'scrypt' || n !== '16384' || r !== '8' || p !== '1' || !/^[a-f0-9]{32}$/.test(saltHex || '') || !/^[a-f0-9]{128}$/.test(hashHex || '')) return false;
+  const expected = Buffer.from(hashHex, 'hex');
+  const actual = await new Promise((resolve, reject) => {
+    scrypt(password, Buffer.from(saltHex, 'hex'), expected.length, { N: 16384, r: 8, p: 1 }, (error, result) => error ? reject(error) : resolve(result));
+  });
+  return timingSafeEqual(expected, Buffer.from(actual));
+}
+
+function normalizeEmail(value) {
+  const email = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (email.length < 3 || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return '';
+  return email;
+}
+
+function passwordIssue(password) {
+  if (typeof password !== 'string') return 'Enter a password.';
+  if (Array.from(password).length < 12) return 'Use at least 12 characters for your password.';
+  if (Array.from(password).length > 128 || Buffer.byteLength(password, 'utf8') > 256) return 'Password is too long.';
+  return '';
+}
+
+function passwordCookieOriginOnly(request, response) {
+  if (sameOriginRequest(request)) return true;
+  sendJson(response, 403, { error: 'Please open FIELDGUIDE from its secure website and try again.' });
+  return false;
+}
+
+async function lookupSession(request) {
+  const token = cookieValue(request, SESSION_COOKIE);
+  if (!token || !databaseReady) return null;
+  const result = await database.query(
+    `SELECT s.id AS session_id, s.csrf_hash, u.id AS user_id, u.email
+     FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.token_hash = $1 AND s.expires_at > now()`,
+    [sha256(token)],
+  );
+  return result.rows[0] || null;
+}
+
+function csrfMatches(expectedHash, suppliedToken) {
+  if (typeof suppliedToken !== 'string' || !suppliedToken) return false;
+  const expected = Buffer.from(expectedHash || '', 'utf8');
+  const actual = Buffer.from(sha256(suppliedToken), 'utf8');
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+async function requireSession(request, response, { csrf = false } = {}) {
+  if (!database) {
+    sendJson(response, 503, { error: 'Account storage is not configured yet.' });
+    return null;
+  }
+  await databaseInitialization;
+  if (!accountStorageReady()) {
+    sendJson(response, 503, { error: 'Account storage is temporarily unavailable. Please try again later.' });
+    return null;
+  }
+  let session;
+  try { session = await lookupSession(request); }
+  catch { sendJson(response, 503, { error: 'Account storage is temporarily unavailable. Please try again later.' }); return null; }
+  if (!session) {
+    sendJson(response, 401, { error: 'Sign in to continue.' });
+    return null;
+  }
+  if (csrf && !csrfMatches(session.csrf_hash, request.headers['x-csrf-token'])) {
+    sendJson(response, 403, { error: 'Your session has expired. Refresh the page and try again.' });
+    return null;
+  }
+  return session;
+}
+
+async function createSession(response, user) {
+  const token = randomBytes(32).toString('base64url');
+  const csrfToken = randomBytes(32).toString('base64url');
+  await database.query(
+    'INSERT INTO sessions(id, user_id, token_hash, csrf_hash, expires_at) VALUES($1, $2, $3, $4, now() + ($5 * interval \'1 day\'))',
+    [randomUUID(), user.id, sha256(token), sha256(csrfToken), SESSION_DAYS],
+  );
+  setSessionCookie(response, token);
+  return { user: { email: user.email }, csrfToken };
+}
+
+function sanitizeProgram(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  let serialized;
+  try { serialized = JSON.stringify(raw); } catch { return null; }
+  if (!serialized || Buffer.byteLength(serialized, 'utf8') > 850000) return null;
+  const short = (value, limit = 320) => cleanText(value, limit);
+  const pathName = short(raw.pathName, 160);
+  const pathKey = short(raw.pathKey, 80);
+  const route = short(raw.route, 80);
+  const weeks = Number(raw.weeks);
+  const days = Number(raw.days);
+  if (!pathName || !pathKey || !route || !Number.isInteger(weeks) || weeks < 1 || weeks > 104 || !Number.isInteger(days) || days < 3 || days > 6) return null;
+  if (!Array.isArray(raw.weekRecords) || raw.weekRecords.length !== weeks || !raw.plan || !Array.isArray(raw.plan.weeks) || raw.plan.weeks.length !== weeks) return null;
+  const safeSessions = (list) => Array.isArray(list) ? list.slice(0, 6).map((session) => ({
+    day: short(session?.day, 40), name: short(session?.name, 120), detail: short(session?.detail, 480), progression: short(session?.progression, 320),
+  })).filter((session) => Object.values(session).every(Boolean)) : [];
+  const safeWeeks = raw.weekRecords.slice(0, 104).map((week, index) => {
+    const sessions = safeSessions(week?.sessions);
+    if (Number(week?.week) !== index + 1 || sessions.length !== days) return null;
+    return {
+      week: index + 1, phase: short(week.phase, 80), focus: short(week.focus, 240), intensityTarget: short(week.intensityTarget, 320),
+      adjustment: short(week.adjustment, 320), checkpoint: week.checkpoint === true, endpoint: short(week.endpoint, 240),
+      milestone: short(week.milestone, 320), tissueDose: short(week.tissueDose, 420), recoveryDose: short(week.recoveryDose, 420), sessions,
+    };
+  });
+  if (safeWeeks.some((week) => !week || Object.entries(week).some(([key, value]) => key !== 'checkpoint' && key !== 'week' && !value))) return null;
+  const baseline = (Array.isArray(raw.baseline) ? raw.baseline : []).slice(0, 32).map((item) => ({
+    id: short(item?.id, 80), label: short(item?.label, 180), kind: short(item?.kind, 30), value: short(String(item?.value ?? ''), 100),
+    target: short(item?.target, 100), status: short(item?.status, 80),
+  })).filter((item) => item.label);
+  const scoreList = (Array.isArray(raw.scores) ? raw.scores : []).slice(0, 32).map((item) => ({
+    label: short(item?.label, 180), value: short(String(item?.value ?? ''), 100), target: short(item?.target, 100), status: short(item?.status, 80),
+  })).filter((item) => item.label);
+  const planWeeks = safeWeeks.map((week) => ({ ...week }));
+  return {
+    version: 1, pathKey, pathName, kind: short(raw.kind, 120), route, goal: short(raw.goal, 120), weeks, days,
+    baseline, scores: scoreList, weekRecords: safeWeeks,
+    plan: { rationale: short(raw.plan.rationale, 900), priorities: Array.isArray(raw.plan.priorities) ? raw.plan.priorities.slice(0, 6).map((x) => short(x, 120)).filter(Boolean) : [], weeks: planWeeks },
+    planRationale: short(raw.planRationale, 900), sessionMinutes: Math.min(90, Math.max(20, Number(raw.sessionMinutes) || 45)),
+    equipment: short(raw.equipment, 100), focus: short(raw.focus, 180), gaps: Array.isArray(raw.gaps) ? raw.gaps.slice(0, 10).map((x) => short(x, 180)).filter(Boolean) : [],
+    gapTarget: short(raw.gapTarget, 100), limits: short(raw.limits, 300),
+  };
+}
+
+function encryptProgram(program) {
+  if (!planEncryptionKey) throw new Error('Private plan storage is not configured.');
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', planEncryptionKey, iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(program), 'utf8'), cipher.final()]);
+  return { version: 1, iv: iv.toString('hex'), tag: cipher.getAuthTag().toString('hex'), data: encrypted.toString('base64') };
+}
+
+function decryptProgram(record) {
+  if (!planEncryptionKey || record?.version !== 1 || !/^[a-f0-9]{24}$/i.test(record.iv || '') || !/^[a-f0-9]{32}$/i.test(record.tag || '') || typeof record.data !== 'string') {
+    throw new Error('Saved plan is unavailable.');
+  }
+  const decipher = createDecipheriv('aes-256-gcm', planEncryptionKey, Buffer.from(record.iv, 'hex'));
+  decipher.setAuthTag(Buffer.from(record.tag, 'hex'));
+  return JSON.parse(Buffer.concat([decipher.update(Buffer.from(record.data, 'base64')), decipher.final()]).toString('utf8'));
+}
+
+async function handleAccountApi(request, response, url) {
+  const pathname = url.pathname;
+  const accountPath = pathname.startsWith('/api/auth/') || pathname.startsWith('/api/plans');
+  if (!accountPath) return false;
+  if (request.method === 'OPTIONS') { sendJson(response, 405, { error: 'Account requests must come from the website.' }); return true; }
+  if (['POST', 'DELETE'].includes(request.method) && !passwordCookieOriginOnly(request, response)) return true;
+  if (request.method === 'POST' && request.headers['content-type']?.split(';')[0] !== 'application/json') {
+    sendJson(response, 415, { error: 'Send account details as JSON.' }); return true;
+  }
+  if (pathname === '/api/auth/register' && request.method === 'POST') {
+    if (!authRateAllowed(request, response, 'register', 8)) return true;
+    if (!database) { sendJson(response, 503, { error: 'Account storage is not configured yet.' }); return true; }
+    await databaseInitialization;
+    if (!accountStorageReady()) { sendJson(response, 503, { error: 'Account storage is not configured yet.' }); return true; }
+    try {
+      const body = await readJson(request, MAX_ACCOUNT_BODY_BYTES);
+      const email = normalizeEmail(body?.email);
+      const password = body?.password;
+      const issue = passwordIssue(password);
+      if (!email) { sendJson(response, 400, { error: 'Enter a valid email address.' }); return true; }
+      if (issue) { sendJson(response, 400, { error: issue }); return true; }
+      const passwordHash = await hashPassword(password);
+      const user = { id: randomUUID(), email };
+      await database.query('INSERT INTO users(id, email, password_hash) VALUES($1, $2, $3)', [user.id, user.email, passwordHash]);
+      sendJson(response, 201, await createSession(response, user));
+    } catch (error) {
+      if (error?.code === '23505') { sendJson(response, 409, { error: 'An account could not be created with those details.' }); return true; }
+      if (Number.isInteger(error?.statusCode)) sendJson(response, error.statusCode, { error: error.message });
+      else { console.error('Account registration failed without logging account details.'); sendJson(response, 503, { error: 'Account storage is temporarily unavailable.' }); }
+    }
+    return true;
+  }
+  if (pathname === '/api/auth/login' && request.method === 'POST') {
+    if (!authRateAllowed(request, response, 'login', 10)) return true;
+    if (!database) { sendJson(response, 503, { error: 'Account storage is not configured yet.' }); return true; }
+    await databaseInitialization;
+    if (!accountStorageReady()) { sendJson(response, 503, { error: 'Account storage is not configured yet.' }); return true; }
+    try {
+      const body = await readJson(request, MAX_ACCOUNT_BODY_BYTES);
+      const email = normalizeEmail(body?.email);
+      const password = typeof body?.password === 'string' && body.password.length <= 128 ? body.password : '';
+      const result = email ? await database.query('SELECT id, email, password_hash FROM users WHERE email = $1', [email]) : { rows: [] };
+      const user = result.rows[0];
+      const valid = user ? await verifyPassword(password, user.password_hash) : false;
+      if (!valid) { sendJson(response, 401, { error: 'Email or password was not recognized.' }); return true; }
+      sendJson(response, 200, await createSession(response, user));
+    } catch {
+      console.error('Account sign-in failed without logging account details.');
+      sendJson(response, 503, { error: 'Account storage is temporarily unavailable.' });
+    }
+    return true;
+  }
+  if (pathname === '/api/auth/me' && request.method === 'GET') {
+    const session = await requireSession(request, response);
+    if (!session) return true;
+    const csrfToken = randomBytes(32).toString('base64url');
+    try {
+      await database.query('UPDATE sessions SET csrf_hash = $1 WHERE id = $2', [sha256(csrfToken), session.session_id]);
+      sendJson(response, 200, { user: { email: session.email }, csrfToken });
+    } catch { sendJson(response, 503, { error: 'Account storage is temporarily unavailable.' }); }
+    return true;
+  }
+  if (pathname === '/api/auth/logout' && request.method === 'POST') {
+    const session = await requireSession(request, response, { csrf: true });
+    if (!session) return true;
+    try {
+      await database.query('DELETE FROM sessions WHERE id = $1', [session.session_id]);
+      clearSessionCookie(response);
+      sendJson(response, 200, { ok: true });
+    } catch { sendJson(response, 503, { error: 'Account storage is temporarily unavailable.' }); }
+    return true;
+  }
+  if (pathname === '/api/auth/account' && request.method === 'DELETE') {
+    const session = await requireSession(request, response, { csrf: true });
+    if (!session) return true;
+    try {
+      await database.query('DELETE FROM users WHERE id = $1', [session.user_id]);
+      clearSessionCookie(response);
+      sendJson(response, 200, { ok: true });
+    } catch { sendJson(response, 503, { error: 'Account storage is temporarily unavailable.' }); }
+    return true;
+  }
+  if (pathname === '/api/plans' && request.method === 'GET') {
+    const session = await requireSession(request, response);
+    if (!session) return true;
+    try {
+      const result = await database.query('SELECT id, title, pathway, route, weeks, created_at FROM plans WHERE user_id = $1 ORDER BY created_at DESC', [session.user_id]);
+      sendJson(response, 200, { plans: result.rows.map((plan) => ({ id: plan.id, title: plan.title, pathway: plan.pathway, route: plan.route, weeks: plan.weeks, savedAt: plan.created_at })) });
+    } catch { sendJson(response, 503, { error: 'Saved plans are temporarily unavailable.' }); }
+    return true;
+  }
+  if (pathname === '/api/plans' && request.method === 'POST') {
+    const session = await requireSession(request, response, { csrf: true });
+    if (!session) return true;
+    if (!authRateAllowed(request, response, 'save-plan', 20, 60 * 60 * 1000)) return true;
+    try {
+      const body = await readJson(request, MAX_ACCOUNT_BODY_BYTES);
+      const safeProgram = sanitizeProgram(body?.program);
+      if (!safeProgram) { sendJson(response, 400, { error: 'This plan could not be saved. Please rebuild it and try again.' }); return true; }
+      const id = randomUUID();
+      const title = `${safeProgram.pathName} · ${safeProgram.route}`.slice(0, 200);
+      await database.query(
+        'INSERT INTO plans(id, user_id, title, pathway, route, weeks, plan) VALUES($1, $2, $3, $4, $5, $6, $7::jsonb)',
+        [id, session.user_id, title, safeProgram.pathName, safeProgram.route, safeProgram.weeks, JSON.stringify(encryptProgram(safeProgram))],
+      );
+      sendJson(response, 201, { id, title, savedAt: new Date().toISOString() });
+    } catch {
+      console.error('Plan save failed without logging plan details or account information.');
+      sendJson(response, 503, { error: 'The plan could not be saved right now. Please try again.' });
+    }
+    return true;
+  }
+  const planMatch = pathname.match(/^\/api\/plans\/([0-9a-f-]{36})$/i);
+  if (planMatch && request.method === 'GET') {
+    const session = await requireSession(request, response);
+    if (!session) return true;
+    try {
+      const result = await database.query('SELECT id, plan FROM plans WHERE id = $1 AND user_id = $2', [planMatch[1], session.user_id]);
+      if (!result.rows[0]) sendJson(response, 404, { error: 'Saved plan not found.' });
+      else sendJson(response, 200, { id: result.rows[0].id, program: decryptProgram(result.rows[0].plan) });
+    } catch { sendJson(response, 503, { error: 'Saved plans are temporarily unavailable.' }); }
+    return true;
+  }
+  if (planMatch && request.method === 'DELETE') {
+    const session = await requireSession(request, response, { csrf: true });
+    if (!session) return true;
+    try {
+      const result = await database.query('DELETE FROM plans WHERE id = $1 AND user_id = $2', [planMatch[1], session.user_id]);
+      if (result.rowCount === 0) sendJson(response, 404, { error: 'Saved plan not found.' });
+      else sendJson(response, 200, { ok: true });
+    } catch { sendJson(response, 503, { error: 'Saved plans are temporarily unavailable.' }); }
+    return true;
+  }
+  sendJson(response, 405, { error: 'Account request not supported.' }, { allow: 'GET, POST, DELETE' });
+  return true;
 }
 
 function validateInput(input) {
@@ -360,9 +765,11 @@ async function serveStatic(request, response, pathname) {
 const server = createServer(async (request, response) => {
   const url = new URL(request.url || '/', 'http://localhost');
   if (url.pathname === '/health' && request.method === 'GET') {
-    sendJson(response, 200, { status: 'ok', aiConfigured: Boolean(process.env.OPENAI_API_KEY) });
+    await databaseInitialization;
+    sendJson(response, 200, { status: 'ok', aiConfigured: Boolean(process.env.OPENAI_API_KEY), accountsAvailable: accountStorageReady() });
     return;
   }
+  if (await handleAccountApi(request, response, url)) return;
   if (url.pathname === '/api/generate-plan') {
     const cors = corsHeaders(request);
     if (cors === null) { sendJson(response, 403, { error: 'This website is not allowed to use the plan API.' }); return; }
