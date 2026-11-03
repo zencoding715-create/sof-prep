@@ -91,7 +91,17 @@ async function initializeDatabase() {
       'ENOTFOUND', 'ETIMEDOUT', 'ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH',
       '28P01', '28000', '3D000', '42501', '53300', '57P01',
     ]);
-    const diagnostic = knownCodes.has(error?.code) ? error.code : 'DATABASE_INITIALIZATION_FAILED';
+    const message = typeof error?.message === 'string' ? error.message : '';
+    const diagnostic = knownCodes.has(error?.code) || /^[0-9A-Z]{5}$/.test(error?.code || '')
+      ? error.code
+      : /tenant or user not found/i.test(message) ? 'POOLER_TENANT_NOT_FOUND'
+      : /password authentication failed/i.test(message) ? 'PASSWORD_AUTHENTICATION_FAILED'
+      : /SASL|SCRAM/i.test(message) ? 'DATABASE_AUTH_HANDSHAKE_FAILED'
+      : /invalid (url|connection string)/i.test(message) ? 'DATABASE_URL_INVALID'
+      : /certificate|self.signed/i.test(message) ? 'DATABASE_CERTIFICATE_FAILED'
+      : /timeout|timed out/i.test(message) ? 'DATABASE_CONNECTION_TIMEOUT'
+      : /connection (terminated|closed)/i.test(message) ? 'DATABASE_CONNECTION_CLOSED'
+      : 'DATABASE_INITIALIZATION_FAILED';
     console.error(`Account storage could not initialize (${diagnostic}); account routes will stay unavailable.`);
     return false;
   }
