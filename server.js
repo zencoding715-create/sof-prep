@@ -24,6 +24,8 @@ const rateBuckets = new Map();
 const authRateBuckets = new Map();
 const SESSION_DAYS = 30;
 const SESSION_COOKIE = 'fg_session';
+const ADMIN_SESSION_HOURS = 12;
+const ADMIN_SESSION_COOKIE = 'fg_admin_session';
 const database = process.env.DATABASE_URL ? new Pool({
   connectionString: process.env.DATABASE_URL,
   max: 5,
@@ -56,6 +58,15 @@ async function initializeDatabase() {
       );
       CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
+      CREATE TABLE IF NOT EXISTS admin_sessions (
+        id uuid PRIMARY KEY,
+        token_hash char(64) NOT NULL UNIQUE,
+        csrf_hash char(64) NOT NULL,
+        key_hash char(64) NOT NULL,
+        expires_at timestamptz NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS admin_sessions_expiry_idx ON admin_sessions(expires_at);
       CREATE TABLE IF NOT EXISTS plans (
         id uuid PRIMARY KEY,
         user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -69,6 +80,7 @@ async function initializeDatabase() {
       );
       CREATE INDEX IF NOT EXISTS plans_user_created_idx ON plans(user_id, created_at DESC);
       DELETE FROM sessions WHERE expires_at < now();
+      DELETE FROM admin_sessions WHERE expires_at < now();
     `);
     databaseReady = true;
     return true;
@@ -323,6 +335,164 @@ async function requireSession(request, response, { csrf = false } = {}) {
     return null;
   }
   return session;
+}
+
+function validAdminAccessKey(candidate) {
+  const configured = process.env.ADMIN_ACCESS_KEY || '';
+  if (Buffer.byteLength(configured, 'utf8') < 32 || typeof candidate !== 'string' || candidate.length > 256) return false;
+  return timingSafeEqual(Buffer.from(sha256(candidate), 'hex'), Buffer.from(sha256(configured), 'hex'));
+}
+
+function setAdminCookie(response, token) {
+  response.setHeader('set-cookie', `${ADMIN_SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Strict; Path=/api/admin; Max-Age=${ADMIN_SESSION_HOURS * 60 * 60}`);
+}
+
+function clearAdminCookie(response) {
+  response.setHeader('set-cookie', `${ADMIN_SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/api/admin; Max-Age=0`);
+}
+
+async function lookupAdminSession(request) {
+  const token = cookieValue(request, ADMIN_SESSION_COOKIE);
+  const key = process.env.ADMIN_ACCESS_KEY || '';
+  if (!token || !databaseReady || Buffer.byteLength(key, 'utf8') < 32) return null;
+  const result = await database.query(
+    'SELECT id AS session_id, csrf_hash FROM admin_sessions WHERE token_hash = $1 AND key_hash = $2 AND expires_at > now()',
+    [sha256(token), sha256(key)],
+  );
+  return result.rows[0] || null;
+}
+
+async function requireAdmin(request, response, { csrf = false } = {}) {
+  if (!database || Buffer.byteLength(process.env.ADMIN_ACCESS_KEY || '', 'utf8') < 32) {
+    sendJson(response, 503, { error: 'The private dashboard is not configured yet.' });
+    return null;
+  }
+  await databaseInitialization;
+  if (!accountStorageReady()) {
+    sendJson(response, 503, { error: 'The private dashboard is not configured yet.' });
+    return null;
+  }
+  let session;
+  try { session = await lookupAdminSession(request); }
+  catch { sendJson(response, 503, { error: 'The private dashboard is temporarily unavailable.' }); return null; }
+  if (!session) {
+    sendJson(response, 401, { error: 'Sign in to the private dashboard.' });
+    return null;
+  }
+  if (csrf && !csrfMatches(session.csrf_hash, request.headers['x-csrf-token'])) {
+    sendJson(response, 403, { error: 'Your dashboard session expired. Refresh the page and try again.' });
+    return null;
+  }
+  if (!authRateAllowed(request, response, 'admin-read', 240, 60 * 1000)) return null;
+  return session;
+}
+
+async function handleAdminApi(request, response, url) {
+  const pathname = url.pathname;
+  if (!pathname.startsWith('/api/admin/')) return false;
+  if (['POST', 'DELETE'].includes(request.method) && !passwordCookieOriginOnly(request, response)) return true;
+  if (request.method === 'POST' && request.headers['content-type']?.split(';')[0] !== 'application/json') {
+    sendJson(response, 415, { error: 'Send dashboard details as JSON.' }); return true;
+  }
+  if (pathname === '/api/admin/login' && request.method === 'POST') {
+    if (!authRateAllowed(request, response, 'admin-login', 6)) return true;
+    if (!database) { sendJson(response, 503, { error: 'Private data storage is not ready yet.' }); return true; }
+    await databaseInitialization;
+    if (!accountStorageReady()) { sendJson(response, 503, { error: 'Private data storage is not ready yet.' }); return true; }
+    const key = process.env.ADMIN_ACCESS_KEY || '';
+    if (Buffer.byteLength(key, 'utf8') < 32) { sendJson(response, 503, { error: 'The private dashboard key has not been set up yet.' }); return true; }
+    try {
+      const body = await readJson(request, 4096);
+      if (!validAdminAccessKey(body?.accessKey)) { sendJson(response, 401, { error: 'Dashboard key was not recognized.' }); return true; }
+      const token = randomBytes(32).toString('base64url');
+      const csrfToken = randomBytes(32).toString('base64url');
+      const id = randomUUID();
+      const expiresAt = new Date(Date.now() + ADMIN_SESSION_HOURS * 60 * 60 * 1000).toISOString();
+      await database.query(
+        'INSERT INTO admin_sessions(id, token_hash, csrf_hash, key_hash, expires_at) VALUES($1, $2, $3, $4, $5)',
+        [id, sha256(token), sha256(csrfToken), sha256(key), expiresAt],
+      );
+      setAdminCookie(response, token);
+      sendJson(response, 200, { csrfToken });
+    } catch {
+      console.error('Private dashboard sign-in failed without logging credentials.');
+      sendJson(response, 503, { error: 'The private dashboard is temporarily unavailable.' });
+    }
+    return true;
+  }
+  if (pathname === '/api/admin/me' && request.method === 'GET') {
+    const session = await requireAdmin(request, response);
+    if (!session) return true;
+    const csrfToken = randomBytes(32).toString('base64url');
+    try {
+      await database.query('UPDATE admin_sessions SET csrf_hash = $1 WHERE id = $2', [sha256(csrfToken), session.session_id]);
+      sendJson(response, 200, { csrfToken });
+    } catch { sendJson(response, 503, { error: 'The private dashboard is temporarily unavailable.' }); }
+    return true;
+  }
+  if (pathname === '/api/admin/logout' && request.method === 'POST') {
+    const session = await requireAdmin(request, response, { csrf: true });
+    if (!session) return true;
+    try {
+      await database.query('DELETE FROM admin_sessions WHERE id = $1', [session.session_id]);
+      clearAdminCookie(response);
+      sendJson(response, 200, { ok: true });
+    } catch { sendJson(response, 503, { error: 'The private dashboard is temporarily unavailable.' }); }
+    return true;
+  }
+  if (pathname === '/api/admin/overview' && request.method === 'GET') {
+    if (!await requireAdmin(request, response)) return true;
+    try {
+      const [users, plans] = await Promise.all([
+        database.query('SELECT COUNT(*)::int AS count FROM users'),
+        database.query('SELECT COUNT(*)::int AS count FROM plans'),
+      ]);
+      sendJson(response, 200, { accounts: users.rows[0].count, savedPlans: plans.rows[0].count });
+    } catch { sendJson(response, 503, { error: 'Dashboard data is temporarily unavailable.' }); }
+    return true;
+  }
+  if (pathname === '/api/admin/accounts' && request.method === 'GET') {
+    if (!await requireAdmin(request, response)) return true;
+    const limit = Math.max(1, Math.min(50, Number.parseInt(url.searchParams.get('limit') || '25', 10) || 25));
+    const offset = Math.max(0, Math.min(1000000, Number.parseInt(url.searchParams.get('offset') || '0', 10) || 0));
+    try {
+      const [rows, total] = await Promise.all([
+        database.query(`SELECT u.email, u.created_at, COUNT(p.id)::int AS saved_plans
+          FROM users u LEFT JOIN plans p ON p.user_id = u.id
+          GROUP BY u.id ORDER BY u.created_at DESC LIMIT $1 OFFSET $2`, [limit, offset]),
+        database.query('SELECT COUNT(*)::int AS count FROM users'),
+      ]);
+      sendJson(response, 200, { accounts: rows.rows.map(row => ({ email: row.email, createdAt: row.created_at, savedPlans: row.saved_plans })), total: total.rows[0].count, limit, offset });
+    } catch { sendJson(response, 503, { error: 'Account data is temporarily unavailable.' }); }
+    return true;
+  }
+  if (pathname === '/api/admin/plans' && request.method === 'GET') {
+    if (!await requireAdmin(request, response)) return true;
+    const limit = Math.max(1, Math.min(50, Number.parseInt(url.searchParams.get('limit') || '25', 10) || 25));
+    const offset = Math.max(0, Math.min(1000000, Number.parseInt(url.searchParams.get('offset') || '0', 10) || 0));
+    try {
+      const [rows, total] = await Promise.all([
+        database.query(`SELECT p.id, p.title, p.pathway, p.route, p.weeks, p.created_at, u.email
+          FROM plans p JOIN users u ON u.id = p.user_id
+          ORDER BY p.created_at DESC LIMIT $1 OFFSET $2`, [limit, offset]),
+        database.query('SELECT COUNT(*)::int AS count FROM plans'),
+      ]);
+      sendJson(response, 200, { plans: rows.rows.map(row => ({ id: row.id, title: row.title, pathway: row.pathway, route: row.route, weeks: row.weeks, savedAt: row.created_at, email: row.email })), total: total.rows[0].count, limit, offset });
+    } catch { sendJson(response, 503, { error: 'Saved-plan data is temporarily unavailable.' }); }
+    return true;
+  }
+  const planMatch = pathname.match(/^\/api\/admin\/plans\/([0-9a-f-]{36})$/i);
+  if (planMatch && request.method === 'GET') {
+    if (!await requireAdmin(request, response)) return true;
+    try {
+      const result = await database.query(`SELECT p.id, u.email, p.plan FROM plans p JOIN users u ON u.id = p.user_id WHERE p.id = $1`, [planMatch[1]]);
+      if (!result.rows[0]) sendJson(response, 404, { error: 'Saved plan not found.' });
+      else sendJson(response, 200, { id: result.rows[0].id, email: result.rows[0].email, program: decryptProgram(result.rows[0].plan) });
+    } catch { sendJson(response, 503, { error: 'Saved-plan details are temporarily unavailable.' }); }
+    return true;
+  }
+  sendJson(response, 405, { error: 'Dashboard request not supported.' }, { allow: 'GET, POST' });
+  return true;
 }
 
 async function createSession(response, user) {
@@ -767,9 +937,15 @@ const server = createServer(async (request, response) => {
   const url = new URL(request.url || '/', 'http://localhost');
   if (url.pathname === '/health' && request.method === 'GET') {
     await databaseInitialization;
-    sendJson(response, 200, { status: 'ok', aiConfigured: Boolean(process.env.OPENAI_API_KEY), accountsAvailable: accountStorageReady() });
+    sendJson(response, 200, {
+      status: 'ok',
+      aiConfigured: Boolean(process.env.OPENAI_API_KEY),
+      accountsAvailable: accountStorageReady(),
+      adminConfigured: accountStorageReady() && Buffer.byteLength(process.env.ADMIN_ACCESS_KEY || '', 'utf8') >= 32,
+    });
     return;
   }
+  if (await handleAdminApi(request, response, url)) return;
   if (await handleAccountApi(request, response, url)) return;
   if (url.pathname === '/api/generate-plan') {
     const cors = corsHeaders(request);
