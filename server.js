@@ -196,7 +196,7 @@ function sendJson(response, status, value, extraHeaders = {}) {
 function corsHeaders(request) {
   const origin = request.headers.origin;
   if (!origin) return {};
-  if (!ALLOWED_ORIGINS.has(origin)) return null;
+  if (!ALLOWED_ORIGINS.has(origin) && !sameOriginRequest(request)) return null;
   return {
     'access-control-allow-origin': origin,
     'access-control-allow-methods': 'POST, OPTIONS',
