@@ -957,6 +957,9 @@ async function callClaudePlan({ system, content, schema, outputBudget, phase, ab
       signal: abortSignal ? AbortSignal.any([abortSignal, AbortSignal.timeout(120000)]) : AbortSignal.timeout(120000),
       body: JSON.stringify({
         model: MODEL,
+        // Sonnet 5.5 otherwise uses adaptive thinking by default, which can consume
+        // the entire response budget before the structured plan is returned.
+        ...(MODEL === 'claude-sonnet-5-5' ? { thinking: { type: 'between_tools' } } : {}),
         max_tokens: outputBudget,
         system,
         messages: [{ role: 'user', content }],
@@ -1001,7 +1004,7 @@ async function createPlan(input, { onProgress = () => {}, abortSignal } = {}) {
     if (abortSignal?.aborted) throw Object.assign(new Error('Plan generation cancelled.'), { statusCode: 499 });
     const block = Math.floor((startWeek - 1) / PLAN_BLOCK_WEEKS);
     const blockWeeks = endWeek - startWeek + 1;
-    const outputBudget = Math.min(12000, Math.max(3500, 2000 + blockWeeks * (600 + input.days * 350)));
+    const outputBudget = Math.min(16000, Math.max(10000, 4000 + blockWeeks * (800 + input.days * 450)));
     const segment = { startWeek, endWeek, totalWeeks: input.weeks, block: block + 1, totalBlocks };
     const previousWeeks = allWeeks.slice(-2);
     const earlierPhases = allWeeks.slice(0, -2).map(({ week, phase, focus, milestone }) => ({ week, phase, focus, milestone }));
