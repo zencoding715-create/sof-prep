@@ -135,7 +135,7 @@
       section('WEEKLY FOCUS', week.focus, title);
       section('EFFORT TARGET', week.intensityTarget, title);
       const sessions = Array.isArray(week.sessions) ? week.sessions : [];
-      const labels = ['DAY', 'SESSION / WORKOUT', 'PROGRESSION'], widths = [82, 298, 156];
+      const labels = ['DAY', 'CATEGORY', 'WORKOUT DETAILS'], widths = [82, 126, 328];
       tableHeader(labels, widths, title, subtitle);
       const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
       const aliases = {mon:0,monday:0,tue:1,tues:1,tuesday:1,wed:2,weds:2,wednesday:2,thu:3,thur:3,thurs:3,thursday:3,fri:4,friday:4,sat:5,saturday:5,sun:6,sunday:6};
@@ -146,7 +146,11 @@
         if (dayIndex !== undefined && !assigned.has(dayIndex)) assigned.set(dayIndex, session);
         else extra.push(session);
       }
-      const drawSession = (label, session) => tableRow([label, session ? [session.name, session.detail].filter(Boolean).join('\n') : 'No session listed', session?.progression || ''], widths, labels, title, subtitle);
+      const drawSession = (label, session) => {
+        if (!session) return tableRow([label, 'REST', 'No session scheduled'], widths, labels, title, subtitle);
+        tableRow([label, 'SESSION', [session.name, session.detail, session.progression && `Progression: ${session.progression}`].filter(Boolean).join('\n')], widths, labels, title, subtitle);
+        for (const block of (session.blocks || [])) tableRow(['', block.category, block.prescription], widths, labels, title, subtitle);
+      };
       if (assigned.size) {
         days.forEach((day, i) => drawSession(day, assigned.get(i)));
         extra.forEach(session => drawSession(toText(session.day) || 'Not specified', session));

@@ -25,7 +25,7 @@ const rateBuckets = new Map();
 const planAccountBuckets = new Map();
 const authRateBuckets = new Map();
 const planJobs = new Map();
-const PLAN_BLOCK_WEEKS = 8;
+const PLAN_BLOCK_WEEKS = 4;
 const JOB_RETENTION_MS = 2 * 60 * 60 * 1000;
 const SESSION_DAYS = 30;
 const SESSION_COOKIE = 'fg_session';
@@ -158,8 +158,9 @@ const PLAN_SCHEMA = {
                 name: { type: 'string' },
                 detail: { type: 'string' },
                 progression: { type: 'string' },
+                blocks: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { category: { type: 'string', enum: ['Cardio', 'Physical training', 'Swim', 'Loaded movement', 'Mobility and recovery'] }, prescription: { type: 'string' } }, required: ['category', 'prescription'] } },
               },
-              required: ['day', 'name', 'detail', 'progression'],
+              required: ['day', 'name', 'detail', 'progression', 'blocks'],
             },
           },
         },
@@ -187,11 +188,11 @@ Generate exactly the requested number of weeks and exactly the requested number 
 
 Include intensityTarget for each week to state the planned easy/moderate/hard distribution and overall effort target. In each session's detail, give concrete sets/reps/distance/intensity/rest and include an RPE from 1 to 10: easy work is generally RPE 2–4, moderate 5–6, hard quality work 7–8. Make hard sessions genuinely purposeful for a prepared athlete, with easier work later in the week. Use at most two hard sessions for newer trainees; allow a third quality session only for an experienced athlete with adequate timeline and recovery. Never turn every day into a hard day or prescribe routine all-out efforts. Match the workload to the user's baseline and experience, and do not force double sessions. Separate hard running from loaded marching, and only add loaded marching when the selected path calls for it and the baseline supports it. Build progressively, include a reduced-load recovery week about every 3–4 weeks and in longer cycles as appropriate, add review checkpoints at least every two weeks, and taper the final 1–2 weeks when the horizon permits while retaining brief, controlled intensity.
 
-Write each session as a practical daily workout, using short labeled parts in detail: Warm-up; Main; Cooldown. Give the main work specific movements and appropriate sets, reps, duration or distance, effort, and rest where relevant; include a brief warm-up and cooldown within the user's session time. Keep each detail under 480 characters. Select the mix of conditioning, strength, surface swimming, loaded movement, and recovery to suit the pathway and the individual's baseline, equipment, pool access, restrictions, and available time; do not force every discipline into every week. Where all components of a surface-swim prescription have a known distance, include the correctly calculated total. Reserve non-session days for recovery rather than inventing additional workouts, and make weekly recovery and checkpoint instructions useful and specific to the user. Use sequential training phases and change each week deliberately as the preparation window progresses. Describe the prescribed work in original language.
+Use the reference's seven-day weekly grid concept: organize each training day into individually prescribed category blocks, choosing among Cardio, Physical training, Swim, Loaded movement, and Mobility and recovery. Blocks are parts of ONE session, not extra workouts: the sum of warm-up, every block, rest and cooldown must fit sessionMinutes. Do not fill every cell or prescribe every category every day. Each week should include appropriate strength/calisthenics as well as aerobic work if no relevant restriction prevents it; for aquatic pathways include supervised surface-swim blocks when poolAccess and ability allow. Do not let running crowd out all strength or relevant swimming. Split strength into specific movements with sets and repetitions; cardio into a concrete time/distance and effort; swims into warm-up, main set, cooldown, rest and correct total. Use a sensible small number of blocks according to time and recovery. Assign each active block a category and its own specific prescription; never output filler such as 'as appropriate' or 'do strength work'. The user's constraints, profile, and available time control the dose; the example's demanding fixed workload is not a prescription to copy. Write each session as a practical daily workout, using short labeled parts in detail: Warm-up; Main; Cooldown. Give the main work specific movements and appropriate sets, reps, duration or distance, effort, and rest where relevant; include a brief warm-up and cooldown within the user's session time. Keep each detail under 480 characters. Select the mix of conditioning, strength, surface swimming, loaded movement, and recovery to suit the pathway and the individual's baseline, equipment, pool access, restrictions, and available time; do not force every discipline into every week. Where all components of a surface-swim prescription have a known distance, include the correctly calculated total. Reserve non-session days for recovery rather than inventing additional workouts, and make weekly recovery and checkpoint instructions useful and specific to the user. Use sequential training phases and change each week deliberately as the preparation window progresses. Describe the prescribed work in original language.
 
 Swimming must be ordinary surface swimming in a lifeguarded pool. Never prescribe breath-hold, underwater, hypoxic, apnea, hyperventilation, or solo water tests. Never prescribe training through pain, maximal tests for an unprepared person, or abrupt jumps in running/ruck load. If restrictions mention pain, injury, or medical limits, keep the affected area unloaded and make the plan conservative; advise clearance from a qualified clinician before resuming that activity. Do not prescribe rehabilitation. Tissue-capacity work must be brief, general, symptom-free strength/balance work; do not claim that it repairs or prevents tendon or ligament injury.
 
-Return concise, useful JSON matching the required schema. Every week must include its phase, focus, individual intensity target, progression adjustment, milestone, recovery dose, general tendon/joint capacity dose, and the requested sessions. Keep phase at most 80 characters; focus and endpoint at most 240; intensityTarget, adjustment and milestone at most 320; tissueDose and recoveryDose at most 420. In sessions, keep day at most 40, name at most 120, detail at most 480, and progression at most 320 characters. Mark a checkpoint at every second week and at the final week. Keep the final taper easy enough to arrive rested. If a score is absent, treat it as unknown.`;
+Return concise, useful JSON matching the required schema. Every week must include its phase, focus, individual intensity target, progression adjustment, milestone, recovery dose, general tendon/joint capacity dose, and the requested sessions. Keep phase at most 80 characters; focus and endpoint at most 240; intensityTarget, adjustment and milestone at most 320; tissueDose and recoveryDose at most 420. In sessions, keep day at most 40, name at most 120, detail at most 480, progression at most 320, and each category block prescription at most 700 characters. Include 1–4 nonempty category blocks per session. The detail is a short overall warm-up/cooldown and RPE; category blocks contain the concrete main workouts. Mark a checkpoint at every second week and at the final week. Keep the final taper easy enough to arrive rested. If a score is absent, treat it as unknown.`;
 
 
 const REVIEW_SCHEMA = {
@@ -578,7 +579,8 @@ function sanitizeProgram(raw) {
   if (!Array.isArray(raw.weekRecords) || raw.weekRecords.length !== weeks || !raw.plan || !Array.isArray(raw.plan.weeks) || raw.plan.weeks.length !== weeks) return null;
   const safeSessions = (list) => Array.isArray(list) ? list.slice(0, 6).map((session) => ({
     day: short(session?.day, 40), name: short(session?.name, 120), detail: short(session?.detail, 480), progression: short(session?.progression, 320),
-  })).filter((session) => Object.values(session).every(Boolean)) : [];
+    blocks: Array.isArray(session?.blocks) ? session.blocks.slice(0, 4).map(block => ({ category: short(block.category, 40), prescription: short(block.prescription, 700) })).filter(block => block.category && block.prescription) : [],
+  })).filter((session) => session.day && session.name && session.detail && session.progression) : [];
   const safeWeeks = raw.weekRecords.slice(0, 104).map((week, index) => {
     const sessions = safeSessions(week?.sessions);
     if (Number(week?.week) !== index + 1 || sessions.length !== days) return null;
@@ -871,14 +873,28 @@ function validatePlan(plan, input, { startWeek = 1, totalWeeks = input.weeks } =
         progression: cleanText(session?.progression, 320),
       };
       if (Object.values(value).some((text) => !text)) throw new Error('The AI response contained an incomplete session. Please try again.');
+      if (!Array.isArray(session.blocks) || session.blocks.length < 1 || session.blocks.length > 4) throw new Error('The AI response omitted categorized workout details. Please try again.');
+      const allowedCategories = new Set(['Cardio', 'Physical training', 'Swim', 'Loaded movement', 'Mobility and recovery']);
+      const seenCategories = new Set();
+      value.blocks = session.blocks.map(block => {
+        if (!block || !allowedCategories.has(block.category) || seenCategories.has(block.category) || typeof block.prescription !== 'string' || !block.prescription.trim() || block.prescription.trim().length > 700) throw new Error('The AI response included an incomplete workout category. Please try again.');
+        seenCategories.add(block.category);
+        return { category: block.category, prescription: cleanText(block.prescription, 700) };
+      });
+
       if (!/\bRPE\b/i.test(value.detail)) throw new Error('The AI response omitted a clear effort target for a session. Please try again.');
       if (days.has(value.day.toLowerCase())) throw new Error('The AI response placed two sessions on the same day. Please try again.');
       days.add(value.day.toLowerCase());
-      if (/underwater|breath[ -]?hold|hypoxic|apnea|hyperventilat|submerged/i.test(`${value.name} ${value.detail}`)) {
+      if (/underwater|breath[ -]?hold|hypoxic|apnea|hyperventilat|submerged/i.test(`${value.name} ${value.detail} ${value.blocks.map(block => block.prescription).join(" ")}`)) {
         throw new Error('The AI response included a water-training item that this service does not allow. Please try again.');
       }
       return value;
     });
+    if (sessions.some(session => !/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)$/.test(session.day))) throw new Error('The AI response used an invalid training day. Please try again.');
+    const categories = new Set(sessions.flatMap(session => session.blocks.map(block => block.category)));
+    if (!input.restrictions && !categories.has('Physical training')) throw new Error('The AI response omitted physical training from a week. Please try again.');
+    const aquatic = new Set(['cct', 'pj', 'sr', 'navy', 'swcc', 'eod', 'diver', 'airr', 'hm-atf', 'recon', 'coast-ast']);
+    if (!input.restrictions && input.poolAccess && aquatic.has(input.pathKey) && !categories.has('Swim')) throw new Error('The AI response omitted swim preparation from an aquatic pathway. Please try again.');
     return {
       week: weekNumber,
       phase: cleanText(week.phase, 80),
@@ -984,7 +1000,7 @@ async function createPlan(input, { onProgress = () => {}, abortSignal } = {}) {
     const startWeek = block * PLAN_BLOCK_WEEKS + 1;
     const endWeek = Math.min(input.weeks, startWeek + PLAN_BLOCK_WEEKS - 1);
     const blockWeeks = endWeek - startWeek + 1;
-    const outputBudget = Math.min(12000, Math.max(3500, 1500 + blockWeeks * (500 + input.days * 130)));
+    const outputBudget = Math.min(12000, Math.max(3500, 2000 + blockWeeks * (600 + input.days * 350)));
     const segment = { startWeek, endWeek, totalWeeks: input.weeks, block: block + 1, totalBlocks };
     const previousWeeks = allWeeks.slice(-2);
     const earlierPhases = allWeeks.slice(0, -2).map(({ week, phase, focus, milestone }) => ({ week, phase, focus, milestone }));
